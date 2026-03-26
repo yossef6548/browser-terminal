@@ -1,10 +1,11 @@
-require('dotenv').config();
+import dotenv from 'dotenv';
+import express from 'express';
+import cors from 'cors';
+import crypto from 'crypto';
+import os from 'os';
+import pty from 'node-pty';
 
-const express = require('express');
-const cors = require('cors');
-const crypto = require('crypto');
-const os = require('os');
-const pty = require('node-pty');
+dotenv.config();
 
 const app = express();
 
