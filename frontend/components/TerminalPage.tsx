@@ -1,9 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import { Terminal } from 'xterm';
+import { Terminal } from '@xterm/xterm';
 import { FitAddon } from '@xterm/addon-fit';
-import 'xterm/css/xterm.css';
+import '@xterm/xterm/css/xterm.css';
 import styles from './TerminalPage.module.css';
 
 type CreateSessionResponse = {
@@ -18,12 +18,11 @@ type BackendMessage = {
   message?: string;
 };
 
-type ConnectionState = 'idle' | 'connecting' | 'connected' | 'reconnecting' | 'disconnected' | 'error';
+type ConnectionState = 'idle' | 'connecting' | 'connected' | 'disconnected' | 'error';
 
 const DEFAULT_TOKEN_STORAGE_KEY = 'browser-terminal-token';
-const INPUT_FLUSH_INTERVAL_MS = 20;
-const STREAM_STALE_AFTER_MS = 45_000;
-const MAX_RECONNECT_ATTEMPTS = 6;
+const INPUT_FLUSH_INTERVAL_MS = 25;
+const MAX_BATCH_CHARS = 2048;
 
 export default function TerminalPage() {
   const terminalRef = useRef<HTMLDivElement | null>(null);
@@ -31,18 +30,12 @@ export default function TerminalPage() {
   const fitRef = useRef<FitAddon | null>(null);
   const eventSourceRef = useRef<EventSource | null>(null);
   const sessionIdRef = useRef<string | null>(null);
-  const resizeTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const resizeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const cleanupResizeRef = useRef<(() => void) | null>(null);
 
   const inputBufferRef = useRef('');
-  const inputFlushTimerRef = useRef<NodeJS.Timeout | null>(null);
+  const inputFlushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const inputInFlightRef = useRef(false);
-
-  const reconnectTimerRef = useRef<NodeJS.Timeout | null>(null);
-  const reconnectAttemptsRef = useRef(0);
-  const suppressReconnectRef = useRef(false);
-  const lastStreamMessageAtRef = useRef(0);
-  const streamWatchdogRef = useRef<NodeJS.Timeout | null>(null);
 
   const [token, setToken] = useState('');
   const [state, setState] = useState<ConnectionState>('idle');
@@ -67,27 +60,12 @@ export default function TerminalPage() {
     return result;
   }, [token]);
 
-  const clearReconnectTimer = useCallback(() => {
-    if (reconnectTimerRef.current) {
-      clearTimeout(reconnectTimerRef.current);
-      reconnectTimerRef.current = null;
-    }
-  }, []);
-
-  const clearWatchdog = useCallback(() => {
-    if (streamWatchdogRef.current) {
-      clearInterval(streamWatchdogRef.current);
-      streamWatchdogRef.current = null;
-    }
-  }, []);
-
   const closeEventSource = useCallback(() => {
     if (eventSourceRef.current) {
       eventSourceRef.current.close();
       eventSourceRef.current = null;
     }
-    clearWatchdog();
-  }, [clearWatchdog]);
+  }, []);
 
   const postJson = useCallback(
     async (path: string, body?: unknown, method = 'POST') => {
@@ -117,14 +95,16 @@ export default function TerminalPage() {
   );
 
   const flushInput = useCallback(async () => {
+    inputFlushTimerRef.current = null;
+
     const id = sessionIdRef.current;
     if (!id || stateRef.current !== 'connected' || inputInFlightRef.current || !inputBufferRef.current) {
       return;
     }
 
     inputInFlightRef.current = true;
-    const payload = inputBufferRef.current;
-    inputBufferRef.current = '';
+    const payload = inputBufferRef.current.slice(0, MAX_BATCH_CHARS);
+    inputBufferRef.current = inputBufferRef.current.slice(payload.length);
 
     try {
       await postJson(`/session/${id}/input`, { data: payload });
@@ -133,7 +113,7 @@ export default function TerminalPage() {
       inputBufferRef.current = payload + inputBufferRef.current;
     } finally {
       inputInFlightRef.current = false;
-      if (inputBufferRef.current) {
+      if (inputBufferRef.current && !inputFlushTimerRef.current) {
         inputFlushTimerRef.current = setTimeout(() => {
           void flushInput();
         }, INPUT_FLUSH_INTERVAL_MS);
@@ -146,29 +126,38 @@ export default function TerminalPage() {
       if (!data) {
         return;
       }
+
       inputBufferRef.current += data;
-      if (inputFlushTimerRef.current) {
+
+      if (inputBufferRef.current.length >= MAX_BATCH_CHARS) {
+        if (!inputInFlightRef.current) {
+          void flushInput();
+        }
         return;
       }
-      inputFlushTimerRef.current = setTimeout(() => {
-        inputFlushTimerRef.current = null;
-        void flushInput();
-      }, INPUT_FLUSH_INTERVAL_MS);
+
+      if (!inputFlushTimerRef.current) {
+        inputFlushTimerRef.current = setTimeout(() => {
+          void flushInput();
+        }, INPUT_FLUSH_INTERVAL_MS);
+      }
     },
     [flushInput]
   );
 
   const sendResize = useCallback(async () => {
-    const sessionIdValue = sessionIdRef.current;
+    const id = sessionIdRef.current;
     const terminal = xtermRef.current;
     const fitAddon = fitRef.current;
-    if (!sessionIdValue || !terminal || !fitAddon) {
+
+    if (!id || !terminal || !fitAddon) {
       return;
     }
 
     fitAddon.fit();
+
     try {
-      await postJson(`/session/${sessionIdValue}/resize`, {
+      await postJson(`/session/${id}/resize`, {
         cols: terminal.cols,
         rows: terminal.rows
       });
@@ -191,47 +180,6 @@ export default function TerminalPage() {
     return () => window.removeEventListener('resize', handler);
   }, [sendResize]);
 
-  const scheduleReconnect = useCallback(() => {
-    if (suppressReconnectRef.current || !sessionIdRef.current || !token.trim()) {
-      return;
-    }
-
-    if (reconnectAttemptsRef.current >= MAX_RECONNECT_ATTEMPTS) {
-      setState('disconnected');
-      setStatusText('Disconnected (reconnect limit reached)');
-      xtermRef.current?.writeln('\r\n[reconnect failed: maximum attempts reached]');
-      return;
-    }
-
-    const waitMs = Math.min(8_000, 300 * 2 ** reconnectAttemptsRef.current);
-    reconnectAttemptsRef.current += 1;
-    setState('reconnecting');
-    setStatusText(`Reconnecting in ${Math.ceil(waitMs / 1000)}s...`);
-
-    clearReconnectTimer();
-    reconnectTimerRef.current = setTimeout(() => {
-      const id = sessionIdRef.current;
-      if (!id) {
-        return;
-      }
-      attachStream(id, token.trim());
-    }, waitMs);
-  }, [clearReconnectTimer, token]);
-
-  const startWatchdog = useCallback(() => {
-    clearWatchdog();
-    streamWatchdogRef.current = setInterval(() => {
-      if (stateRef.current !== 'connected') {
-        return;
-      }
-      if (Date.now() - lastStreamMessageAtRef.current > STREAM_STALE_AFTER_MS) {
-        xtermRef.current?.writeln('\r\n[stream appears stale, reconnecting...]');
-        closeEventSource();
-        scheduleReconnect();
-      }
-    }, 5_000);
-  }, [clearWatchdog, closeEventSource, scheduleReconnect]);
-
   const attachStream = useCallback((id: string, currentToken: string) => {
     closeEventSource();
 
@@ -240,15 +188,11 @@ export default function TerminalPage() {
     eventSourceRef.current = source;
 
     source.onopen = () => {
-      reconnectAttemptsRef.current = 0;
-      lastStreamMessageAtRef.current = Date.now();
       setState('connected');
       setStatusText('Connected');
-      startWatchdog();
     };
 
     source.addEventListener('message', (event) => {
-      lastStreamMessageAtRef.current = Date.now();
       const terminal = xtermRef.current;
       if (!terminal) {
         return;
@@ -262,13 +206,17 @@ export default function TerminalPage() {
         return;
       }
 
+      if (payload.type === 'heartbeat') {
+        return;
+      }
+
       if (payload.type === 'data' && payload.data) {
         terminal.write(payload.data);
       } else if (payload.type === 'exit') {
         terminal.writeln(`\r\n[process exited${payload.exitCode !== undefined ? ` with code ${payload.exitCode}` : ''}]`);
         setState('disconnected');
         setStatusText('Shell exited');
-        suppressReconnectRef.current = true;
+        closeEventSource();
       } else if (payload.type === 'error') {
         terminal.writeln(`\r\n[stream error] ${payload.message ?? 'Unknown error'}`);
         setState('error');
@@ -277,16 +225,21 @@ export default function TerminalPage() {
     });
 
     source.onerror = () => {
+      if (stateRef.current === 'connected') {
+        setState('disconnected');
+        setStatusText('Disconnected');
+        xtermRef.current?.writeln('\r\n[connection lost]');
+      }
       closeEventSource();
-      scheduleReconnect();
     };
-  }, [closeEventSource, scheduleReconnect, startWatchdog]);
+  }, [closeEventSource]);
 
   const connect = useCallback(async () => {
     const terminal = xtermRef.current;
     if (!terminal) {
       return;
     }
+
     if (!token.trim()) {
       setState('error');
       setStatusText('Token is required');
@@ -294,16 +247,13 @@ export default function TerminalPage() {
       return;
     }
 
-    suppressReconnectRef.current = false;
-    reconnectAttemptsRef.current = 0;
-    clearReconnectTimer();
-
     window.localStorage.setItem(DEFAULT_TOKEN_STORAGE_KEY, token.trim());
     setState('connecting');
     setStatusText('Creating session...');
 
     try {
       closeEventSource();
+
       if (sessionIdRef.current) {
         try {
           await postJson(`/session/${sessionIdRef.current}`, undefined, 'DELETE');
@@ -313,11 +263,17 @@ export default function TerminalPage() {
       }
 
       inputBufferRef.current = '';
+      if (inputFlushTimerRef.current) {
+        clearTimeout(inputFlushTimerRef.current);
+        inputFlushTimerRef.current = null;
+      }
+
       terminal.reset();
       terminal.writeln('Connecting...');
 
       const fitAddon = fitRef.current;
       fitAddon?.fit();
+
       const result = (await postJson('/session', {
         cols: xtermRef.current?.cols ?? 120,
         rows: xtermRef.current?.rows ?? 35
@@ -333,14 +289,19 @@ export default function TerminalPage() {
       setStatusText('Failed to connect');
       terminal.writeln(`\r\n[error] ${error instanceof Error ? error.message : String(error)}`);
     }
-  }, [attachStream, clearReconnectTimer, closeEventSource, postJson, sendResize, token]);
+  }, [attachStream, closeEventSource, postJson, sendResize, token]);
 
   const disconnect = useCallback(async () => {
-    suppressReconnectRef.current = true;
-    clearReconnectTimer();
     closeEventSource();
 
     const terminal = xtermRef.current;
+
+    if (inputFlushTimerRef.current) {
+      clearTimeout(inputFlushTimerRef.current);
+      inputFlushTimerRef.current = null;
+    }
+    inputBufferRef.current = '';
+
     if (sessionIdRef.current) {
       try {
         await postJson(`/session/${sessionIdRef.current}`, undefined, 'DELETE');
@@ -354,7 +315,7 @@ export default function TerminalPage() {
     setState('idle');
     setStatusText('Disconnected');
     terminal?.writeln('\r\n[disconnected]');
-  }, [clearReconnectTimer, closeEventSource, postJson]);
+  }, [closeEventSource, postJson]);
 
   useEffect(() => {
     if (!terminalRef.current || xtermRef.current) {
@@ -366,7 +327,7 @@ export default function TerminalPage() {
       fontFamily: 'Menlo, Monaco, Consolas, "Courier New", monospace',
       fontSize: 14,
       lineHeight: 1.25,
-      scrollback: 8_000,
+      scrollback: 8000,
       convertEol: false,
       theme: {
         background: '#020617',
@@ -394,7 +355,6 @@ export default function TerminalPage() {
     });
 
     const beforeUnload = () => {
-      suppressReconnectRef.current = true;
       closeEventSource();
     };
 
@@ -405,20 +365,24 @@ export default function TerminalPage() {
       window.removeEventListener('beforeunload', beforeUnload);
       cleanupResizeRef.current?.();
       closeEventSource();
-      clearReconnectTimer();
+
       if (inputFlushTimerRef.current) {
         clearTimeout(inputFlushTimerRef.current);
       }
+      if (resizeTimerRef.current) {
+        clearTimeout(resizeTimerRef.current);
+      }
+
       terminal.dispose();
       xtermRef.current = null;
       fitRef.current = null;
     };
-  }, [bindResize, clearReconnectTimer, closeEventSource, enqueueInput]);
+  }, [bindResize, closeEventSource, enqueueInput]);
 
   const stateClass =
     state === 'connected'
       ? styles.success
-      : state === 'connecting' || state === 'reconnecting'
+      : state === 'connecting'
         ? styles.warning
         : state === 'error'
           ? styles.error
@@ -430,7 +394,7 @@ export default function TerminalPage() {
         <div className={styles.header}>
           <div className={styles.titleBlock}>
             <div className={styles.title}>Browser Terminal</div>
-            <div className={styles.subtitle}>Low-latency buffered input, auto-reconnect stream handling, and a real PTY shell on your Ubuntu box.</div>
+            <div className={styles.subtitle}>Buffered input, real PTY shell, up-arrow history, tab completion, Ctrl+C, colors, and resize support.</div>
           </div>
           <div className={styles.controls}>
             <input
@@ -441,7 +405,7 @@ export default function TerminalPage() {
               placeholder="Backend token"
               autoComplete="off"
             />
-            <button className={styles.button} onClick={() => void connect()} disabled={state === 'connecting' || state === 'reconnecting'}>
+            <button className={styles.button} onClick={() => void connect()} disabled={state === 'connecting'}>
               Connect
             </button>
             <button className={`${styles.button} ${styles.secondary}`} onClick={() => void disconnect()}>
