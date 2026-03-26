@@ -1,0 +1,15 @@
+[Unit]
+Description=Browser Terminal Backend
+After=network.target tailscaled.service
+Wants=network.target
+
+[Service]
+Type=simple
+WorkingDirectory=%h/browser-terminal/backend
+EnvironmentFile=%h/browser-terminal/backend/.env
+ExecStart=/usr/bin/node %h/browser-terminal/backend/src/server.js
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=default.target
