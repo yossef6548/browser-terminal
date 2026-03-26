@@ -1,7 +1,7 @@
 [Unit]
 Description=Browser Terminal Backend
-After=network.target tailscaled.service
-Wants=network.target
+After=network-online.target tailscaled.service
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -10,6 +10,7 @@ EnvironmentFile=%h/browser-terminal/backend/.env
 ExecStart=/usr/bin/node %h/browser-terminal/backend/src/server.js
 Restart=always
 RestartSec=5
+KillSignal=SIGINT
 
 [Install]
 WantedBy=default.target
