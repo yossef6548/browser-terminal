@@ -15,6 +15,8 @@ The browser stays on Vercel domain. Vercel rewrites `/backend/*` requests to Tai
 - Tab completion
 - Ctrl+C, colors, prompt editing
 - terminal resize support
+- buffered input transport for lower request overhead while typing
+- automatic stream stale detection and reconnect with exponential backoff
 - token-based backend auth
 - one-click Vercel deployment once the repo is on GitHub
 
@@ -110,6 +112,8 @@ SHELL_PATH=/bin/bash
 IDLE_TIMEOUT_MS=21600000
 MAX_SESSIONS=3
 CORS_ORIGIN=
+MAX_INPUT_SIZE_BYTES=16384
+MAX_BUFFER_CHARS=500000
 ```
 
 Generate a strong token if you want:
@@ -321,4 +325,3 @@ Make sure the backend shell is really `/bin/bash` and that the PTY is being crea
 - This is powerful remote shell access. Treat it like SSH access.
 
 ---
-

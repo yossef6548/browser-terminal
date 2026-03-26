@@ -15,6 +15,8 @@ const SHELL = process.env.SHELL_PATH || process.env.SHELL || '/bin/bash';
 const IDLE_TIMEOUT_MS = Number(process.env.IDLE_TIMEOUT_MS || 1000 * 60 * 60 * 6);
 const MAX_SESSIONS = Number(process.env.MAX_SESSIONS || 3);
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '';
+const MAX_INPUT_SIZE_BYTES = Number(process.env.MAX_INPUT_SIZE_BYTES || 16_384);
+const MAX_BUFFER_CHARS = Number(process.env.MAX_BUFFER_CHARS || 500_000);
 
 if (!TERMINAL_TOKEN) {
   console.error('TERMINAL_TOKEN is required');
@@ -137,8 +139,8 @@ function createSession({ cols = 120, rows = 35 } = {}) {
 
   shell.onData((data) => {
     session.buffer += data;
-    if (session.buffer.length > 500_000) {
-      session.buffer = session.buffer.slice(-500_000);
+    if (session.buffer.length > MAX_BUFFER_CHARS) {
+      session.buffer = session.buffer.slice(-MAX_BUFFER_CHARS);
     }
 
     for (const client of session.clients) {
@@ -213,6 +215,14 @@ app.post('/session/:id/input', requireAuth, (req, res) => {
   }
 
   const data = typeof req.body?.data === 'string' ? req.body.data : '';
+  if (data.length > MAX_INPUT_SIZE_BYTES) {
+    return res.status(413).json({ error: `Input payload too large (max ${MAX_INPUT_SIZE_BYTES} bytes)` });
+  }
+
+  if (!data) {
+    return res.status(400).json({ error: 'Input payload missing' });
+  }
+
   session.pty.write(data);
   touchSession(session);
   res.json({ ok: true });
